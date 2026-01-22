@@ -23,8 +23,8 @@ jobs:
     name: Create Git Tag
     runs-on: ubuntu-22.04
     outputs:
-      current_tag: ${{ steps.create-tag.outputs.current_tag }}
-      next_tag: ${{ steps.create-tag.outputs.next_tag }}
+      latest_tag: ${{ steps.version.outputs.latest_tag }}
+      new_tag: ${{ steps.version.outputs.new_tag }}
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
@@ -116,7 +116,7 @@ jobs:
         file: ./Dockerfile.multiarch
         platforms: linux/amd64,linux/arm64
         push: true
-        tags: ${{ env.DOCKER_IMAGE_PATH }}:${{ needs.create-tag.outputs.next_tag }}
+        tags: ${{ env.DOCKER_IMAGE_PATH }}:${{ needs.create-tag.outputs.new_tag }}
         cache-from: type=gha
         cache-to: type=gha,mode=max
         build-args: |
@@ -127,7 +127,7 @@ jobs:
       run: |
         set -e
         
-        TAG="${{ needs.create-tag.outputs.next_tag }}"
+        TAG="${{ needs.create-tag.outputs.new_tag }}"
         IMAGE="${{ env.DOCKER_IMAGE_PATH }}"
         
         echo "🔍 Verifying image in registry..."
@@ -143,7 +143,7 @@ jobs:
     - name: Set Build Outputs
       id: set-outputs
       run: |
-        VERSION="${{ needs.create-tag.outputs.next_tag }}"
+        VERSION="${{ needs.create-tag.outputs.new_tag }}"
         REPO="${{ env.DOCKER_IMAGE_PATH }}"
         
         echo "image-repository=$REPO" >> $GITHUB_OUTPUT
@@ -177,13 +177,13 @@ jobs:
     steps:
     - name: Create Build Summary
       run: |
-        IMAGE="${{ env.DOCKER_IMAGE_PATH }}:${{ needs.create-tag.outputs.next_tag }}"
+        IMAGE="${{ env.DOCKER_IMAGE_PATH }}:${{ needs.create-tag.outputs.new_tag }}"
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a $GITHUB_STEP_SUMMARY
         echo "✅ PIPELINE COMPLETED" | tee -a $GITHUB_STEP_SUMMARY
         echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a $GITHUB_STEP_SUMMARY
         echo "" | tee -a $GITHUB_STEP_SUMMARY
-        echo "**Previous Tag:** ${{ needs.create-tag.outputs.current_tag }}" | tee -a $GITHUB_STEP_SUMMARY
-        echo "**New Tag:** ${{ needs.create-tag.outputs.next_tag }}" | tee -a $GITHUB_STEP_SUMMARY
+        echo "**Previous Tag:** ${{ needs.create-tag.outputs.latest_tag }}" | tee -a $GITHUB_STEP_SUMMARY
+        echo "**New Tag:** ${{ needs.create-tag.outputs.new_tag }}" | tee -a $GITHUB_STEP_SUMMARY
         echo "**Image:** \`$IMAGE\`" | tee -a $GITHUB_STEP_SUMMARY
         echo "" | tee -a $GITHUB_STEP_SUMMARY
         echo "**Platforms:** linux/amd64, linux/arm64" | tee -a $GITHUB_STEP_SUMMARY
