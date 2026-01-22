@@ -1,12 +1,12 @@
 name: "CI - ck-intel-collector - build, test, release"
 
 permissions:
-  contents: write    # Create releases and tags
-  packages: write    # Push Docker images
+  contents: write
+  packages: write
 
 on:
-  workflow_dispatch:     # Manual trigger
-  repository_dispatch:   # Trigger from orchestration pipeline
+  workflow_dispatch:
+  repository_dispatch:
     types: [trigger-build-workflow]
 
 env:
@@ -23,7 +23,7 @@ jobs:
     name: Create Git Tag
     runs-on: ubuntu-22.04
     outputs:
-      latest_tag: ${{ steps.version.outputs.latest_tag }}
+      previous_tag: ${{ steps.version.outputs.previous_tag }}
       new_tag: ${{ steps.version.outputs.new_tag }}
     steps:
     - name: Checkout code
@@ -35,7 +35,8 @@ jobs:
       id: version
       uses: firgga-sunil/poc-app-of-apps/.github/actions/fetch-and-increment-version@main
       with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}   
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+
   build-and-push:
     name: Build and Push Docker Image
     needs: create-tag
@@ -57,16 +58,14 @@ jobs:
     - name: Install OpenTelemetry Collector Builder
       run: |
         set -e
-        
         echo "📦 Installing OpenTelemetry Collector Builder..."
         go install go.opentelemetry.io/collector/cmd/builder@${{ env.BUILDER_VERSION }}
-        
         builder version
         echo "✅ Builder installed successfully"
+
     - name: Build OTEL Collector Binary
       run: |
         set -e
-        
         echo "🔨 Building OpenTelemetry Collector binary..."
         builder --config=builder-config.yaml
         
@@ -78,24 +77,19 @@ jobs:
         
         echo "✅ Binary built successfully: cmd/${{ env.BINARY_NAME }}"
         cmd/${{ env.BINARY_NAME }} --version
+
     - name: Tidy and Test CMD Module
       run: |
         set -e
-        
         echo "🧹 Tidying cmd module (created by builder)..."
         cd cmd
         go mod tidy
         echo "✅ cmd module tidied"
         
-        echo ""
         echo "🧪 Testing cmd module..."
-        if go test -v ./... 2>&1; then
-          echo "✅ cmd module: TESTS PASSED"
-        else
-          echo "❌ cmd module: TESTS FAILED"
-          exit 1
-        fi
+        go test -v ./...
         cd $GITHUB_WORKSPACE
+
     - name: Set up QEMU for Multi-Platform
       uses: docker/setup-qemu-action@v3
 
@@ -123,23 +117,17 @@ jobs:
           BINARY_NAME=${{ env.BINARY_NAME }}
           BUILDER_VERSION=${{ env.BUILDER_VERSION }}
           OTEL_HELM_CHART_VERSION=${{ env.OTEL_HELM_CHART_VERSION }}
+
     - name: Verify Image in Registry
       run: |
         set -e
-        
         TAG="${{ needs.create-tag.outputs.new_tag }}"
         IMAGE="${{ env.DOCKER_IMAGE_PATH }}"
         
         echo "🔍 Verifying image in registry..."
-        if docker manifest inspect "${IMAGE}:${TAG}" > /dev/null 2>&1; then
-          echo "✅ Image successfully pushed to registry"
-          echo ""
-          echo "📋 Image manifest:"
-          docker manifest inspect "${IMAGE}:${TAG}"
-        else
-          echo "❌ Image not found in registry"
-          exit 1
-        fi
+        docker manifest inspect "${IMAGE}:${TAG}" > /dev/null 2>&1 || exit 1
+        echo "✅ Image successfully pushed to registry"
+
     - name: Set Build Outputs
       id: set-outputs
       run: |
@@ -149,11 +137,7 @@ jobs:
         echo "image-repository=$REPO" >> $GITHUB_OUTPUT
         echo "image-tag=$VERSION" >> $GITHUB_OUTPUT
         echo "image-full=$REPO:$VERSION" >> $GITHUB_OUTPUT
-        
-        echo "✅ Build outputs set:"
-        echo "  Repository: $REPO"
-        echo "  Tag: $VERSION"
-        echo "  Full: $REPO:$VERSION"
+
   create-release:
     name: Create GitHub Release
     needs: [create-tag, build-and-push]
@@ -166,10 +150,11 @@ jobs:
       uses: firgga-sunil/poc-app-of-apps/.github/actions/create-github-release@main
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
-        tag: ${{ needs.create-tag.outputs.new_tag }}
-        latest_tag: ${{ needs.create-tag.outputs.latest_tag }}
+        new_tag: ${{ needs.create-tag.outputs.new_tag }}
+        previous_tag: ${{ needs.create-tag.outputs.previous_tag }}
         image: ${{ env.DOCKER_IMAGE_PATH }}
         mark_latest: true
+
   build-summary:
     name: Build Summary
     needs: [create-tag, build-and-push, create-release]
@@ -179,17 +164,17 @@ jobs:
     - name: Create Build Summary
       run: |
         IMAGE="${{ env.DOCKER_IMAGE_PATH }}:${{ needs.create-tag.outputs.new_tag }}"
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a $GITHUB_STEP_SUMMARY
-        echo "✅ PIPELINE COMPLETED" | tee -a $GITHUB_STEP_SUMMARY
-        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a $GITHUB_STEP_SUMMARY
-        echo "" | tee -a $GITHUB_STEP_SUMMARY
-        echo "**Previous Tag:** ${{ needs.create-tag.outputs.latest_tag }}" | tee -a $GITHUB_STEP_SUMMARY
-        echo "**New Tag:** ${{ needs.create-tag.outputs.new_tag }}" | tee -a $GITHUB_STEP_SUMMARY
-        echo "**Image:** \`$IMAGE\`" | tee -a $GITHUB_STEP_SUMMARY
-        echo "" | tee -a $GITHUB_STEP_SUMMARY
-        echo "**Platforms:** linux/amd64, linux/arm64" | tee -a $GITHUB_STEP_SUMMARY
-        echo "" | tee -a $GITHUB_STEP_SUMMARY
-        echo "### Pull Command" | tee -a $GITHUB_STEP_SUMMARY
-        echo '```bash' | tee -a $GITHUB_STEP_SUMMARY
-        echo "docker pull $IMAGE" | tee -a $GITHUB_STEP_SUMMARY
-        echo '```' | tee -a $GITHUB_STEP_SUMMARY
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >> $GITHUB_STEP_SUMMARY
+        echo "✅ PIPELINE COMPLETED" >> $GITHUB_STEP_SUMMARY
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Previous Tag:** ${{ needs.create-tag.outputs.previous_tag }}" >> $GITHUB_STEP_SUMMARY
+        echo "**New Tag:** ${{ needs.create-tag.outputs.new_tag }}" >> $GITHUB_STEP_SUMMARY
+        echo "**Image:** \`$IMAGE\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "**Platforms:** linux/amd64, linux/arm64" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### Pull Command" >> $GITHUB_STEP_SUMMARY
+        echo '```bash' >> $GITHUB_STEP_SUMMARY
+        echo "docker pull $IMAGE" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
