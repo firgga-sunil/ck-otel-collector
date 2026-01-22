@@ -166,9 +166,10 @@ jobs:
       uses: firgga-sunil/poc-app-of-apps/.github/actions/create-github-release@main
       with:
         github_token: ${{ secrets.GITHUB_TOKEN }}
-        tag: ${{ steps.version.outputs.tag }}
-        latest_tag: ${{ steps.version.outputs.latest_tag }}
+        tag: ${{ needs.create-tag.outputs.new_tag }}
+        latest_tag: ${{ needs.create-tag.outputs.latest_tag }}
         image: ${{ env.DOCKER_IMAGE_PATH }}
+        mark_latest: true
   build-summary:
     name: Build Summary
     needs: [create-tag, build-and-push, create-release]
