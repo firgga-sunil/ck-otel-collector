@@ -1,0 +1,50 @@
+processors:
+  metricsaggregator:
+    # Global configuration - applies to all aggregation rules
+    group_by_labels: 
+      - "agent_version"
+      - "path_key"
+      - "service_type"
+    
+    output_resource_attributes:
+      otel_output_metric: "true"
+      otel_output_processor: "metricsaggregator"
+    
+    aggregation_rules:
+      # Aggregate throughput metrics (sum)
+      - metric_pattern: "ns_apache_http_5_2_java_17_ck_graph_throughput"
+        match_type: "strict"
+        output_metric_name: "ns_apache_http_5_2_java_17_ck_graph_throughput_aggregated"
+        aggregation_type: "sum"
+        preserve_original_metrics: false
+        output_metric_type: "gauge"
+      
+      # Aggregate latency metrics (mean)
+      - metric_pattern: ".*latency_p50$"
+        match_type: "regex"
+        output_metric_name: "ns_apache_http_5_2_java_17_ck_graph_latency_p50_mean"
+        aggregation_type: "mean"
+        preserve_original_metrics: false
+        output_metric_type: "gauge"
+
+      # Aggregate response time for average calculation
+      - metric_pattern: "response_time"
+        match_type: "strict"
+        output_metric_name: "cluster_avg_response_time"
+        aggregation_type: "mean"
+        preserve_original_metrics: false
+
+      # Aggregate all latency metrics using regex
+      - metric_pattern: ".*_latency"
+        match_type: "regexp"
+        output_metric_name: "cluster_total_latency"
+        aggregation_type: "sum"
+        preserve_original_metrics: true
+        output_metric_type: "gauge"
+
+      # Count total error instances
+      - metric_pattern: "error_count"
+        match_type: "strict"
+        output_metric_name: "cluster_total_errors"
+        aggregation_type: "sum"
+        preserve_original_metrics: false 

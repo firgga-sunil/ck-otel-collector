@@ -1,0 +1,76 @@
+name: Restart Rollout
+
+# This workflow calls the reusable rollout-restart workflow from ck-ci-cd-commons
+# It provides a simplified interface for restarting OTEL Collector deployments
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select environment for rollout restart'
+        required: true
+        default: 'prod'
+        type: choice
+        options:
+        - prod
+        - demo
+      provider:
+        description: 'Select cloud provider for the cluster'
+        required: true
+        default: 'aws'
+        type: choice
+        options:
+        - aws
+
+jobs:
+  determine-environment:
+    name: Determine Environment Settings
+    runs-on: ubuntu-22.04
+    outputs:
+      namespace: ${{ steps.set-env.outputs.namespace }}
+      cluster_name: ${{ steps.set-env.outputs.cluster_name }}
+      region: ${{ steps.set-env.outputs.region }}
+    steps:
+    - name: Set Environment Variables
+      id: set-env
+      run: |
+        ENVIRONMENT="${{ github.event.inputs.environment }}"
+        PROVIDER="${{ github.event.inputs.provider }}"
+        
+        echo "🔍 Determining settings for Environment: $ENVIRONMENT, Provider: $PROVIDER"
+        
+        # AWS Provider
+        if [ "$PROVIDER" = "aws" ]; then
+          if [ "$ENVIRONMENT" = "prod" ]; then
+            NAMESPACE="codekarma"
+            CLUSTER_NAME="ck-prod"
+            REGION="ap-south-1"
+          elif [ "$ENVIRONMENT" = "demo" ]; then
+            NAMESPACE="demo"
+            CLUSTER_NAME="ck-qa"
+            REGION="us-east-2"
+          else
+            echo "❌ ERROR: Unknown AWS environment: $ENVIRONMENT"
+            echo "Supported AWS environments: prod, demo"
+            exit 1
+          fi
+        fi
+        
+        echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
+        echo "cluster_name=$CLUSTER_NAME" >> $GITHUB_OUTPUT
+        echo "region=$REGION" >> $GITHUB_OUTPUT
+        echo "✅ Provider: $PROVIDER, Environment: $ENVIRONMENT → Namespace: $NAMESPACE, Cluster: $CLUSTER_NAME, Region: $REGION"
+
+  call-rollout-restart:
+    name: Call Reusable Rollout Restart
+    needs: determine-environment
+    uses: codekarma-tech/ck-ci-cd-commons/.github/workflows/rollout-restart-reusable.yml@main
+    with:
+      deployment_name: ck-intel-collector-opentelemetry-collector
+      namespace: ${{ needs.determine-environment.outputs.namespace }}
+      provider: ${{ github.event.inputs.provider }}
+      cluster_name: ${{ needs.determine-environment.outputs.cluster_name }}
+      region: ${{ needs.determine-environment.outputs.region }}
+    secrets:
+      aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }} 

@@ -1,0 +1,339 @@
+name: "Demo: Deploy and Optional Restart"
+
+# Demo deployment workflow - simpler than production
+# No production confirmation needed
+#
+# 🔄 Workflow Order:
+# 1. Validate demo confirmation
+# 2. Parse deployment target
+# 3. Set up kubectl and AWS credentials
+# 4. Deploy to Kubernetes cluster
+# 5. Create deployment summary
+# 6. Trigger rollout restart (if enabled)
+
+permissions:
+  contents: read
+  packages: read
+  actions: write
+  id-token: write 
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_provider:
+        description: 'Select cloud provider for deployment'
+        required: true
+        default: 'aws'
+        type: choice
+        options:
+        - aws
+        - gcp
+      image_tag:
+        description: 'Enter image tag to deploy (e.g., demo-a1b2c3d4)'
+        required: true
+        default: ''
+        type: string
+      demo_confirmation:
+        description: 'Type "deploy in demo" to confirm deployment in demo'
+        required: true
+        default: ''
+        type: string
+      trigger_restart_after_deploy:
+        description: 'Trigger rollout restart after successful deployment (useful for same image deployments)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  # Demo environment - hardcoded
+  CLUSTER_ENV: demo
+  DOCKER_REGISTRY: ghcr.io
+  DOCKER_REGISTRY_USERNAME: ${{ secrets.DOCKER_REGISTRY_USERNAME }}
+  DOCKER_REGISTRY_TOKEN: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+  BINARY_NAME: ck-intel-collector
+  DOCKER_IMAGE_NAME: ck-intel-collector
+  OTEL_HELM_CHART_VERSION: 0.126.0
+
+  # AWS Credentials - Using repository secrets
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: us-east-2
+  EKS_CLUSTER_NAME: ck-qa
+  DEMO_NAMESPACE: demo
+
+  # GCP Workload Identity Federation
+  GCP_PROJECT_ID: resounding-node-471205-f9       # 👈 replace with your project id
+  GCP_WORKLOAD_IDENTITY_PROVIDER: projects/883346821541/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider  # 👈 replace with your WIF provider
+  GCP_SERVICE_ACCOUNT: github-deployer@resounding-node-471205-f9.iam.gserviceaccount.com  # 👈 replace with your SA email
+  GCP_CLUSTER_NAME: demo-cluster
+  GCP_NAMESPACE: test-deployment
+  GCP_REGION: us-east1
+
+jobs:
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-22.04
+    environment: demo
+    continue-on-error: false
+    outputs:
+      provider: ${{ steps.parse-target.outputs.provider }}
+      cluster: ${{ steps.parse-target.outputs.cluster }}
+      namespace: ${{ steps.parse-target.outputs.namespace }}
+      image-repository: ${{ steps.parse-target.outputs.image-repository }}
+      image-tag: ${{ github.event.inputs.image_tag }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Validate Demo Confirmation
+      id: validate-demo-confirmation
+      run: |
+        DEMO_CONFIRMATION="${{ github.event.inputs.demo_confirmation }}"
+        REQUIRED_CONFIRMATION="deploy in demo"
+        
+        echo "🔒 Validating demo deployment confirmation..."
+        echo "User input: '$DEMO_CONFIRMATION'"
+        echo "Required: '$REQUIRED_CONFIRMATION'"
+        echo ""
+        
+        if [ "$DEMO_CONFIRMATION" = "$REQUIRED_CONFIRMATION" ]; then
+          echo "✅ Demo deployment confirmed!"
+          echo "demo-confirmed=true" >> $GITHUB_OUTPUT
+        else
+          echo "❌ DEMO DEPLOYMENT NOT CONFIRMED!"
+          echo ""
+          echo "🚨 SAFETY CHECK FAILED: You must type exactly '$REQUIRED_CONFIRMATION' to deploy to demo"
+          echo "   Current input: '$DEMO_CONFIRMATION'"
+          echo ""
+          echo "💡 This is a safety measure to prevent accidental demo deployments"
+          echo "   Please re-run the workflow with the correct confirmation text"
+          exit 1
+        fi
+
+    - name: Parse deployment target
+      id: parse-target
+      run: |
+        PROVIDER="${{ github.event.inputs.deploy_provider }}"
+        
+        if [[ "$PROVIDER" == "aws" ]]; then
+          CLUSTER="${{ env.CLUSTER_ENV }}"
+          NAMESPACE="${{ env.DEMO_NAMESPACE }}"
+        elif [[ "$PROVIDER" == "gcp" ]]; then
+          CLUSTER="${{ env.GCP_CLUSTER_NAME }}"
+          NAMESPACE="${{ env.GCP_NAMESPACE }}"
+        else
+          echo "ERROR: Unsupported provider '$PROVIDER'"
+          exit 1
+        fi
+
+        # Print cluster and namespace for visibility
+        echo "🔹 Selected Cluster: $CLUSTER"
+        echo "🔹 Selected Namespace: $NAMESPACE"
+        
+        # Calculate image repository
+        IMAGE_REPOSITORY="${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${CLUSTER}/${{ env.DOCKER_IMAGE_NAME }}"
+        
+        echo "provider=$PROVIDER" >> $GITHUB_OUTPUT
+        echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+        echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
+        echo "image-repository=$IMAGE_REPOSITORY" >> $GITHUB_OUTPUT
+        
+        echo "Deploying to $PROVIDER cluster: $CLUSTER, namespace: $NAMESPACE"
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+
+ # AWS Auth & Kubeconfig
+    - name: Configure AWS credentials
+      if: ${{ github.event.inputs.deploy_provider == 'aws' }}
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Update AWS kubeconfig
+      if: ${{ github.event.inputs.deploy_provider == 'aws' }}
+      run: |
+        aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+    # GCP Auth & Kubeconfig
+    - name: Authenticate to GCP (Workload Identity Federation)
+      if: ${{ github.event.inputs.deploy_provider == 'gcp' }}
+      uses: google-github-actions/auth@v2
+      with:
+        workload_identity_provider: ${{ env.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+        service_account: ${{ env.GCP_SERVICE_ACCOUNT }}
+
+    - name: Set up gcloud
+      if: ${{ github.event.inputs.deploy_provider == 'gcp' }}
+      uses: google-github-actions/setup-gcloud@v2
+
+    - name: Configure GKE credentials
+      if: ${{ github.event.inputs.deploy_provider == 'gcp' }}
+      run: |
+        gcloud container clusters get-credentials ${{ env.GCP_CLUSTER_NAME }} \
+          --region ${{ env.GCP_REGION }} \
+          --project ${{ env.GCP_PROJECT_ID }}
+
+    - name: Add Helm repository
+      run: |
+        helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+        helm repo update
+
+    - name: Install gke-gcloud-auth-plugin
+      if: ${{ github.event.inputs.deploy_provider == 'gcp' }}
+      run: |
+        gcloud components install gke-gcloud-auth-plugin --quiet
+        echo "USE_GKE_GCLOUD_AUTH_PLUGIN=True" >> $GITHUB_ENV
+
+    - name: Ensure namespace exists
+      run: |
+        NAMESPACE="${{ steps.parse-target.outputs.namespace }}"
+        if kubectl get namespace "$NAMESPACE" >/dev/null 2>&1; then
+          echo "Namespace $NAMESPACE already exists ✅"
+        else
+          echo "Creating namespace $NAMESPACE..."
+          kubectl create namespace "$NAMESPACE"
+        fi
+
+    - name: Create registry secret
+      run: |
+        NAMESPACE="${{ steps.parse-target.outputs.namespace }}"
+        kubectl create secret docker-registry ck-registry-secret \
+          --docker-server="${{ env.DOCKER_REGISTRY }}" \
+          --docker-username="${{ env.DOCKER_REGISTRY_USERNAME }}" \
+          --docker-password="${{ env.DOCKER_REGISTRY_TOKEN }}" \
+          -n "$NAMESPACE" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        
+        echo "✅ Docker registry secret created/updated successfully"
+        
+    - name: Deploy to Kubernetes
+      id: deploy
+      continue-on-error: false
+      run: |
+        NAMESPACE="${{ steps.parse-target.outputs.namespace }}"
+        ENVIRONMENT="${{ env.CLUSTER_ENV }}"
+        PROVIDER="${{ steps.parse-target.outputs.provider }}"
+        IMAGE_REPOSITORY="${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }}"
+        IMAGE_TAG="${{ github.event.inputs.image_tag }}"
+        
+        # Determine values file
+        VALUES_FILE="helm/values-$PROVIDER-$ENVIRONMENT.yaml"
+        
+        # Check if values file exists
+        if [ ! -f "$VALUES_FILE" ]; then
+          echo "ERROR: Values file not found: $VALUES_FILE"
+          echo "Please ensure the file exists for $PROVIDER-$ENVIRONMENT combination"
+          exit 1
+        fi
+        
+        echo "Deploying to $PROVIDER cluster: $ENVIRONMENT, namespace: $NAMESPACE"
+        echo "Using image: $IMAGE_REPOSITORY:$IMAGE_TAG"
+        echo "Using values file: $VALUES_FILE"
+        
+        # Check if release exists
+        if helm list -n $NAMESPACE | grep -q "ck-intel-collector"; then
+          echo "🔄 Release 'ck-intel-collector' exists - performing upgrade..."
+          OPERATION="upgrade"
+        else
+          echo "🆕 Release 'ck-intel-collector' does not exist - performing install..."
+          OPERATION="install"
+        fi
+        
+        # Use helm upgrade --install for atomic operation
+        helm upgrade --install ck-intel-collector open-telemetry/opentelemetry-collector \
+          --version ${{ env.OTEL_HELM_CHART_VERSION }} \
+          -n $NAMESPACE \
+          -f $VALUES_FILE \
+          --set image.repository="$IMAGE_REPOSITORY" \
+          --set image.tag="$IMAGE_TAG" \
+          --set imagePullSecrets[0].name="ck-registry-secret" \
+          --wait --timeout=10m
+        
+        echo "✅ Helm $OPERATION completed successfully!"
+        echo "✅ Deployment completed successfully to $PROVIDER/$NAMESPACE"
+        echo "Image deployed: $IMAGE_REPOSITORY:$IMAGE_TAG"
+
+  create-deployment-summary:
+    name: Create Deployment Summary
+    needs: deploy
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create Deployment Summary
+      run: |
+        echo "## 🚀 DEMO DEPLOYMENT SUMMARY" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ✅ Demo Deployment Completed Successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🎯 Deployment Target" >> $GITHUB_STEP_SUMMARY
+        echo "- **Provider**: \`${{ needs.deploy.outputs.provider }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cluster**: \`${{ needs.deploy.outputs.cluster }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Namespace**: \`${{ needs.deploy.outputs.namespace }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Full Target**: \`${{ needs.deploy.outputs.provider }}-${{ needs.deploy.outputs.cluster }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📦 Deployed Image" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Repository**: \`${{ needs.deploy.outputs.image-repository }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Tag**: \`${{ needs.deploy.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Full Image**: \`${{ needs.deploy.outputs.image-repository }}:${{ needs.deploy.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🌍 Environment & Deployment Details" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: \`${{ env.CLUSTER_ENV }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Deployment Number**: \`${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Triggered by**: \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Repository**: \`${{ github.repository }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+        echo "- **Docker Registry**: [View Image](https://${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }})" >> $GITHUB_STEP_SUMMARY
+        echo "- **GitHub Repository**: [View Repo](https://github.com/${{ github.repository }})" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📊 Deployment Status" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ✅ **Successfully Deployed**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Kubernetes Release**: \`ck-intel-collector\` in namespace \`${{ needs.deploy.outputs.namespace }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Helm Chart**: \`open-telemetry/opentelemetry-collector\` v${{ env.OTEL_HELM_CHART_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔄 Rollout Restart Status" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ github.event.inputs.trigger_restart_after_deploy }}" = "true" ]; then
+          echo "- **Status**: ✅ **Triggered** - Rollout restart will execute after deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason**: Same image deployment with configuration changes" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Status**: ❌ **Not Triggered** - No restart needed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason**: New image deployment or restart not requested" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🎉 What's Next?" >> $GITHUB_STEP_SUMMARY
+        echo "- **Monitor**: Check deployment status in your Kubernetes cluster" >> $GITHUB_STEP_SUMMARY
+        echo "- **Verify**: Ensure the service is running and accessible" >> $GITHUB_STEP_SUMMARY
+        echo "- **Test**: Verify the demo deployment is working as expected" >> $GITHUB_STEP_SUMMARY
+
+  trigger-rollout-restart:
+    name: Trigger Rollout Restart
+    needs: deploy
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    if: ${{ github.event.inputs.trigger_restart_after_deploy == 'true' }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Trigger Rollout Restart Workflow
+      run: |
+        echo "🔄 Triggering rollout restart after successful demo deployment..."
+        echo "Environment: ${{ env.CLUSTER_ENV }}"
+        echo "Image Tag: ${{ github.event.inputs.image_tag }}"
+        echo ""
+        
+        # Trigger the rollout restart workflow
+        gh workflow run rollout-restart.yml \
+          --field environment="${{ env.CLUSTER_ENV }}" \
+          --field provider="${{ github.event.inputs.deploy_provider }}"
+        
+        echo "✅ Rollout restart workflow triggered successfully!"
+        echo "The rollout restart will now execute in the background"
+      env:
+        GITHUB_TOKEN: ${{ github.token }} 

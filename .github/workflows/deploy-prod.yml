@@ -1,0 +1,382 @@
+name: "Prod: Deploy and Optional Restart"
+
+# How to use this workflow:
+# 
+# 🔒 SAFETY FIRST: You must type "deploy in prod" to confirm production deployment
+# 
+# 📋 Available versions (click to view):
+# - Git Tags: https://github.com/codekarma-tech/ck-otel-collector/tags
+# - Docker Registry: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }}
+#
+# 🎯 Version options:
+# - Git tags: v1.0.0, v1.0.1, v1.0.2, etc.
+# - Custom tags: Any existing tag from the registry
+#
+# ⚠️ Note: The workflow will validate that your selected version exists before deployment
+
+permissions:
+  contents: read
+  packages: read
+  actions: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      deploy_provider:
+        description: 'Select cloud provider for deployment'
+        required: true
+        default: 'aws'
+        type: choice
+        options:
+        - aws
+      image_tag:
+        description: 'Enter image version to deploy (see workflow description above for available versions)'
+        required: true
+        default: ''
+        type: string
+      production_confirmation:
+        description: 'Type "deploy in prod" to confirm production deployment'
+        required: true
+        default: ''
+        type: string
+      trigger_restart_after_deploy:
+        description: 'Trigger rollout restart after successful deployment (useful for same image deployments)'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  # Production environment - hardcoded
+  CLUSTER_ENV: prod
+  DOCKER_REGISTRY: ghcr.io
+  DOCKER_REGISTRY_USERNAME: ${{ secrets.DOCKER_REGISTRY_USERNAME }}
+  DOCKER_REGISTRY_TOKEN: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+  BINARY_NAME: ck-intel-collector
+  DOCKER_IMAGE_NAME: ck-intel-collector
+  OTEL_HELM_CHART_VERSION: 0.126.0
+  # AWS Credentials - Using repository secrets
+  AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+  AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+  AWS_REGION: ap-south-1
+  EKS_CLUSTER_NAME: ck-prod
+  # Namespace configuration
+  PROD_NAMESPACE: codekarma
+
+jobs:
+  fetch-versions:
+    name: Fetch Recent Versions
+    runs-on: ubuntu-22.04
+    outputs:
+      recent-versions: ${{ steps.versions.outputs.recent-versions }}
+      selected-tag: ${{ steps.versions.outputs.selected-tag }}
+      image-repository: ${{ steps.versions.outputs.image-repository }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+      
+    - name: Fetch Recent Versions
+      id: versions
+      run: |
+        echo "🔍 Fetching recent versions..."
+        
+        # Get recent Git tags (last 4)
+        RECENT_TAGS=$(git tag --sort=-version:refname | head -4 | tr '\n' ' ')
+        
+        # Get recent Docker tags from registry (if accessible)
+        DOCKER_TAGS=$(gh api packages/container/${{ env.DOCKER_IMAGE_NAME }}/versions --jq '.versions[].metadata.container.tags[]' 2>/dev/null || echo "")
+        
+        # Combine and format recent versions
+        RECENT_VERSIONS=""
+        if [ -n "$RECENT_TAGS" ]; then
+          RECENT_VERSIONS="$RECENT_TAGS"
+        fi
+        
+        echo "recent-versions=$RECENT_VERSIONS" >> $GITHUB_OUTPUT
+        
+        # Get user's selected tag
+        SELECTED_TAG="${{ github.event.inputs.image_tag }}"
+        echo "selected-tag=$SELECTED_TAG" >> $GITHUB_OUTPUT
+        
+        # Set image repository
+        IMAGE_REPO="${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }}"
+        echo "image-repository=$IMAGE_REPO" >> $GITHUB_OUTPUT
+        
+        echo ""
+        echo "📋 Available versions:"
+        echo "$RECENT_VERSIONS" | tr ' ' '\n' | sort -V
+        echo ""
+        echo "🔗 Version resources:"
+        echo "- Git Tags: https://github.com/codekarma-tech/ck-otel-collector/tags"
+        echo "- Docker Registry: $IMAGE_REPO"
+        echo ""
+        echo "🎯 Selected tag: $SELECTED_TAG"
+        echo "🏗️ Image repository: $IMAGE_REPO"
+        echo ""
+        echo "💡 Tip: Use one of the available versions above or enter a custom tag"
+        echo "   You can also check the Git tags page for more options"
+
+  deploy:
+    name: Deploy
+    needs: fetch-versions
+    runs-on: ubuntu-22.04
+    environment: prod
+    continue-on-error: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Validate Production Confirmation
+      id: validate-prod-confirmation
+      run: |
+        PROD_CONFIRMATION="${{ github.event.inputs.production_confirmation }}"
+        REQUIRED_CONFIRMATION="deploy in prod"
+        
+        echo "🔒 Validating production deployment confirmation..."
+        echo "User input: '$PROD_CONFIRMATION'"
+        echo "Required: '$REQUIRED_CONFIRMATION'"
+        echo ""
+        
+        if [ "$PROD_CONFIRMATION" = "$REQUIRED_CONFIRMATION" ]; then
+          echo "✅ Production deployment confirmed!"
+          echo "production-confirmed=true" >> $GITHUB_OUTPUT
+        else
+          echo "❌ PRODUCTION DEPLOYMENT NOT CONFIRMED!"
+          echo ""
+          echo "🚨 SAFETY CHECK FAILED: You must type exactly '$REQUIRED_CONFIRMATION' to deploy to production"
+          echo "   Current input: '$PROD_CONFIRMATION'"
+          echo ""
+          echo "💡 This is a safety measure to prevent accidental production deployments"
+          echo "   Please re-run the workflow with the correct confirmation text"
+          exit 1
+        fi
+
+    - name: Validate Image Tag
+      id: validate-tag
+      run: |
+        SELECTED_TAG="${{ needs.fetch-versions.outputs.selected-tag }}"
+        IMAGE_REPO="${{ needs.fetch-versions.outputs.image-repository }}"
+        AVAILABLE_VERSIONS="${{ needs.fetch-versions.outputs.recent-versions }}"
+        
+        echo "🔍 Validating tag: $SELECTED_TAG"
+        echo "🏗️ Image repository: $IMAGE_REPO"
+        echo ""
+        
+        # Check if the image tag exists in available versions
+        if echo "$AVAILABLE_VERSIONS" | grep -q "$SELECTED_TAG"; then
+          echo "✅ Tag '$SELECTED_TAG' found in available versions"
+          echo "tag-validated=true" >> $GITHUB_OUTPUT
+        else
+          echo "❌ ERROR: Tag '$SELECTED_TAG' not found in available versions!"
+          echo ""
+          echo "📋 Available versions:"
+          echo "$AVAILABLE_VERSIONS" | tr ' ' '\n' | sort -V
+          echo ""
+          echo "🔗 Check these resources for more versions:"
+          echo "- Git Tags: https://github.com/codekarma-tech/ck-otel-collector/tags"
+          echo "- Docker Registry: $IMAGE_REPO"
+          echo ""
+          echo "💡 Please use one of the available versions above or check the tag name"
+          exit 1
+        fi
+        
+        echo "✅ Tag validation passed"
+
+    - name: Parse deployment target
+      id: parse-target
+      run: |
+        # Get provider from input, use hardcoded production environment
+        PROVIDER="${{ github.event.inputs.deploy_provider }}"
+        CLUSTER="${{ env.CLUSTER_ENV }}"
+        
+        # Validate provider
+        if [[ "$PROVIDER" != "aws" ]]; then
+          echo "ERROR: Unknown provider: $PROVIDER"
+          echo "Valid providers: aws"
+          exit 1
+        fi
+        
+        # Production environment - hardcoded namespace
+        NAMESPACE="${{ env.PROD_NAMESPACE }}"
+        
+        echo "provider=$PROVIDER" >> $GITHUB_OUTPUT
+        echo "cluster=$CLUSTER" >> $GITHUB_OUTPUT
+        echo "namespace=$NAMESPACE" >> $GITHUB_OUTPUT
+        
+        echo "Deploying to $PROVIDER cluster: $CLUSTER, namespace: $NAMESPACE"
+
+    - name: Set up kubectl
+      uses: azure/setup-kubectl@v3
+
+    # AWS Deployment
+    - name: Configure AWS credentials
+      if: steps.parse-target.outputs.provider == 'aws'
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ env.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ env.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Update AWS kubeconfig
+      if: steps.parse-target.outputs.provider == 'aws'
+      run: |
+        aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+    - name: Add Helm repository
+      run: |
+        helm repo add open-telemetry https://open-telemetry.github.io/opentelemetry-helm-charts
+        helm repo update
+
+    - name: Create namespace
+      run: |
+        NAMESPACE="${{ steps.parse-target.outputs.namespace }}"
+        kubectl create namespace $NAMESPACE 2>/dev/null || echo "Namespace $NAMESPACE already exists"
+
+    - name: Create/Update registry secret
+      run: |
+        NAMESPACE="${{ steps.parse-target.outputs.namespace }}"
+        kubectl create secret docker-registry ck-registry-secret \
+          --docker-server="${{ env.DOCKER_REGISTRY }}" \
+          --docker-username="${{ env.DOCKER_REGISTRY_USERNAME }}" \
+          --docker-password="${{ env.DOCKER_REGISTRY_TOKEN }}" \
+          -n "$NAMESPACE" \
+          --dry-run=client -o yaml | kubectl apply -f -
+        
+        echo "✅ Docker registry secret created/updated successfully"        
+
+    - name: Deploy to Kubernetes
+      id: deploy
+      # Stop pipeline if deployment fails
+      continue-on-error: false
+      run: |
+        NAMESPACE="${{ steps.parse-target.outputs.namespace }}"
+        ENVIRONMENT="${{ env.CLUSTER_ENV }}"
+        PROVIDER="${{ steps.parse-target.outputs.provider }}"
+        CLUSTER="${{ steps.parse-target.outputs.cluster }}"
+        # Use environment variables directly instead of job outputs
+        IMAGE_REPOSITORY="${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }}"
+        IMAGE_TAG="${{ needs.fetch-versions.outputs.selected-tag }}"
+        
+
+        
+        # Production environment - hardcoded values file
+        ENV_NAME="$ENVIRONMENT"
+        
+        # Determine values file based on provider and production environment
+        VALUES_FILE="helm/values-$PROVIDER-$CLUSTER.yaml"
+        
+        # Check if values file exists
+        if [ ! -f "$VALUES_FILE" ]; then
+          echo "ERROR: Values file not found: $VALUES_FILE"
+          echo "Please ensure the file exists for $PROVIDER-$CLUSTER combination"
+          exit 1
+        fi
+        
+        echo "Deploying to $PROVIDER cluster: $CLUSTER, namespace: $NAMESPACE (environment: $ENV_NAME)"
+        echo "Using image: $IMAGE_REPOSITORY:$IMAGE_TAG"
+        echo "Using values file: $VALUES_FILE"
+
+        
+        # Upgrade existing release or install new one
+        helm upgrade --install ck-intel-collector open-telemetry/opentelemetry-collector \
+          --version ${{ env.OTEL_HELM_CHART_VERSION }} \
+          -n $NAMESPACE \
+          -f $VALUES_FILE \
+          --set image.repository="$IMAGE_REPOSITORY" \
+          --set image.tag="$IMAGE_TAG" \
+          --set imagePullSecrets[0].name="ck-registry-secret" \
+          --wait --timeout=10m
+        
+        echo "✅ Deployment completed successfully to $PROVIDER/$NAMESPACE"
+        echo "Image deployed: $IMAGE_REPOSITORY:$IMAGE_TAG"
+
+  create-deployment-summary:
+    name: Create Deployment Summary
+    needs: [deploy, fetch-versions]
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create Deployment Summary
+      run: |
+        echo "## 🚀 DEPLOYMENT SUMMARY" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ✅ Deployment Completed Successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🎯 Deployment Target" >> $GITHUB_STEP_SUMMARY
+        # Get provider from input and use environment variables for cluster/namespace
+        PROVIDER="${{ github.event.inputs.deploy_provider }}"
+        CLUSTER="${{ env.CLUSTER_ENV }}"
+        NAMESPACE="${{ env.PROD_NAMESPACE }}"
+        echo "- **Provider**: \`$PROVIDER\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Cluster**: \`$CLUSTER\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Namespace**: \`$NAMESPACE\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Full Target**: \`$PROVIDER-$CLUSTER\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📦 Deployed Image" >> $GITHUB_STEP_SUMMARY
+        # Use environment variables for image information (more reliable than job outputs)
+        IMAGE_REPOSITORY="${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }}"
+        IMAGE_TAG="${{ needs.fetch-versions.outputs.selected-tag }}"
+        echo "- **Image Repository**: \`$IMAGE_REPOSITORY\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Tag**: \`$IMAGE_TAG\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Full Image**: \`$IMAGE_REPOSITORY:$IMAGE_TAG\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🌍 Environment & Deployment Details" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: \`${{ env.CLUSTER_ENV }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Deployment Number**: \`${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Triggered by**: \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Repository**: \`${{ github.repository }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+        echo "- **Docker Registry**: [View Image](https://${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }})" >> $GITHUB_STEP_SUMMARY
+        echo "- **GitHub Repository**: [View Repo](https://github.com/${{ github.repository }})" >> $GITHUB_STEP_SUMMARY
+        echo "- **Git Tags**: [View Tags](https://github.com/${{ github.repository }}/tags)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📊 Deployment Status" >> $GITHUB_STEP_SUMMARY
+        echo "- **Status**: ✅ **Successfully Deployed**" >> $GITHUB_STEP_SUMMARY
+        echo "- **Kubernetes Release**: \`ck-intel-collector\` in namespace \`$NAMESPACE\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Helm Chart**: \`open-telemetry/opentelemetry-collector\` v${{ env.OTEL_HELM_CHART_VERSION }}" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔄 Rollout Restart Status" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ github.event.inputs.trigger_restart_after_deploy }}" = "true" ]; then
+          echo "- **Status**: ✅ **Triggered** - Rollout restart will execute after deployment" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason**: Same image deployment with configuration changes" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Status**: ❌ **Not Triggered** - No restart needed" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason**: New image deployment or restart not requested" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🎉 What's Next?" >> $GITHUB_STEP_SUMMARY
+        echo "- **Monitor**: Check deployment status in your Kubernetes cluster" >> $GITHUB_STEP_SUMMARY
+        echo "- **Verify**: Ensure the service is running and accessible" >> $GITHUB_STEP_SUMMARY
+        echo "- **Scale**: Adjust replica count if needed via Helm values" >> $GITHUB_STEP_SUMMARY
+
+  trigger-rollout-restart:
+    name: Trigger Rollout Restart
+    needs: [deploy, fetch-versions]
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    if: ${{ github.event.inputs.trigger_restart_after_deploy == 'true' }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Trigger Rollout Restart Workflow
+      run: |
+        echo "🔄 Triggering rollout restart after successful deployment..."
+        echo "Environment: ${{ env.CLUSTER_ENV }}"
+        echo "Image Tag: ${{ needs.fetch-versions.outputs.selected-tag }}"
+        echo ""
+        
+        # Trigger the rollout restart workflow
+        gh workflow run rollout-restart.yml \
+          --field environment="${{ env.CLUSTER_ENV }}" \
+          --field provider="${{ steps.parse-target.outputs.provider }}"
+        
+        echo "✅ Rollout restart workflow triggered successfully!"
+        echo "The rollout restart will now execute in the background"
+      env:
+        GITHUB_TOKEN: ${{ github.token }} 

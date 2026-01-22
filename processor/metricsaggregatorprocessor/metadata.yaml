@@ -1,0 +1,33 @@
+type: crossresource
+
+status:
+  class: processor
+  stability:
+    alpha: [metrics]
+  distributions: [contrib]
+  warnings:
+    - This is an alpha component and may change significantly in the future.
+
+resource_attributes:
+  aggregation.level:
+    description: Level of aggregation (cluster, application, etc.)
+    enabled: true
+    type: string
+  aggregation.timestamp:
+    description: Timestamp when aggregation was performed
+    enabled: true
+    type: string
+
+attributes:
+  aggregation.type:
+    description: Type of aggregation performed (sum, mean, min, max, count)
+    enabled: true
+    type: string
+  aggregation.count:
+    description: Number of data points that were aggregated
+    enabled: true
+    type: int
+  aggregation.group_key:
+    description: Key used for grouping data points
+    enabled: true
+    type: string 

@@ -1,0 +1,411 @@
+name: "Prod: Build and Optional Deploy"
+
+# 🔄 Workflow Order:
+# 1. Validate inputs and branch
+# 2. Tidy Go modules (dependency cleanup)
+# 3. Run tests (if enabled)
+# 4. Create Git tag (version calculation + tag creation)
+# 5. Build and push Docker image (with existing tag)
+# 6. If build fails → Cleanup: Delete Git tag
+# 7. Create build summary
+# 8. Trigger deploy (if auto-deploy enabled)
+#
+# Authentication Options:
+# - Uses constant username (sabareesh-ckt) + PAT (DOCKER_REGISTRY_TOKEN)
+
+#TODO:Update all the tokens to prod ones, namespaces and branches as needed
+permissions:
+  contents: write    # Create/push Git tags
+  packages: write    # Push Docker images
+  actions: write     # Trigger other workflows
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_tests:
+        description: 'Run tests before building'
+        required: false
+        default: true
+        type: boolean
+      auto_deploy:
+        description: 'Trigger deploy workflow after build'
+        required: false
+        default: false
+        type: boolean
+      deploy_provider:
+        description: 'Select cloud provider for deployment (only needed if trigger deployment is enabled)'
+        required: false
+        default: 'aws'
+        type: choice
+        options:
+        - aws
+      production_confirmation:
+        description: 'Type "deploy in prod" to confirm deployment to demo (only needed if trigger deployment is enabled)'
+        required: false
+        default: ''
+        type: string
+
+env:
+  # Production environment - hardcoded
+  CLUSTER_ENV: prod
+  DOCKER_REGISTRY: ghcr.io
+  DOCKER_REGISTRY_USERNAME: ${{ secrets.DOCKER_REGISTRY_USERNAME }}
+  DOCKER_REGISTRY_TOKEN: ${{ secrets.DOCKER_REGISTRY_TOKEN }}
+  BINARY_NAME: ck-intel-collector
+  DOCKER_IMAGE_NAME: ck-intel-collector
+  OTEL_HELM_CHART_VERSION: 0.126.0
+  # Branch restriction
+  MAIN_BRANCH: main
+  # Go and Builder versions
+  GO_VERSION: '1.23'
+  BUILDER_VERSION: v0.128.0
+  # Test modules
+  TEST_MODULES: "processor/metricsaggregatorprocessor exporter/prometheusexporter internal/common/testdata internal/coreinternal/testutil cmd"
+
+jobs:
+  validate-inputs:
+    name: Validate Inputs and Branch
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      
+    - name: Validate Branch
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        REQUIRED_BRANCH="${{ env.MAIN_BRANCH }}"
+        
+        echo "🔍 Validating branch for production build..."
+        echo "Current branch: $BRANCH_NAME"
+        echo "Required branch: $REQUIRED_BRANCH"
+        echo ""
+        
+        if [[ "$BRANCH_NAME" != "$REQUIRED_BRANCH" ]]; then
+          echo "❌ PRODUCTION BUILD NOT ALLOWED ON THIS BRANCH!"
+          echo ""
+          echo "🚨 SAFETY CHECK FAILED: Production builds can only run on '$REQUIRED_BRANCH' branch!"
+          echo "   Current branch: '$BRANCH_NAME'"
+          echo "   Required branch: '$REQUIRED_BRANCH'"
+          echo ""
+          echo "💡 Please select '$REQUIRED_BRANCH' branch in the workflow dropdown to continue"
+          exit 1
+        fi
+        
+        echo "✅ Production branch validated: $BRANCH_NAME"
+        
+        # Validate other inputs if needed
+        echo "✅ All inputs validated successfully"
+
+  run-tests:
+    name: Run Tests
+    needs: validate-inputs
+    runs-on: ubuntu-22.04
+    if: ${{ github.event.inputs.run_tests == 'true' }}
+    continue-on-error: true
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Tidy Go Modules
+      run: |
+        echo "🧹 Tidying Go modules for all test modules..."
+        echo "Modules to tidy: ${{ env.TEST_MODULES }}"
+        echo ""
+        
+        TIDIED_MODULES=""
+        FAILED_TIDY=""
+        
+        # Tidy each module
+        for module in ${{ env.TEST_MODULES }}; do
+          echo "Tidying module: $module"
+          if cd $module && go mod tidy 2>&1; then
+            echo "✅ $module: TIDIED"
+            TIDIED_MODULES="$TIDIED_MODULES $module"
+          else
+            echo "❌ $module: TIDY FAILED"
+            FAILED_TIDY="$FAILED_TIDY $module"
+          fi
+          cd $GITHUB_WORKSPACE
+        done
+        
+        echo ""
+        echo "=== TIDY SUMMARY ==="
+        if [ -n "$TIDIED_MODULES" ]; then
+          echo "✅ TIDIED:$TIDIED_MODULES"
+        fi
+        if [ -n "$FAILED_TIDY" ]; then
+          echo "❌ TIDY FAILED:$FAILED_TIDY"
+          exit 1
+        else
+          echo "🎉 All modules tidied successfully!"
+        fi
+        echo ""
+
+    - name: Run Tests
+      run: |
+        echo "🧪 Running tests for modules: ${{ env.TEST_MODULES }}"
+        echo ""
+        PASSED_MODULES=""
+        FAILED_MODULES=""
+        
+        # Test each module
+        for module in ${{ env.TEST_MODULES }}; do
+          echo "Testing module: $module"
+          if cd $module && go test -v ./... 2>&1; then
+            echo "✅ $module: PASSED"
+            PASSED_MODULES="$PASSED_MODULES $module"
+          else
+            echo "❌ $module: FAILED"
+            FAILED_MODULES="$FAILED_MODULES $module"
+          fi
+          cd $GITHUB_WORKSPACE
+        done
+        
+        echo ""
+        echo "=== TEST SUMMARY ==="
+        if [ -n "$PASSED_MODULES" ]; then
+          echo "✅ PASSED:$PASSED_MODULES"
+        fi
+        if [ -n "$FAILED_MODULES" ]; then
+          echo "❌ FAILED:$FAILED_MODULES"
+          exit 1
+        else
+          echo "🎉 All tests passed!"
+        fi
+
+  create-tag:
+    name: Create Git Tag
+    needs: validate-inputs
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    outputs:
+      version: ${{ steps.create-tag.outputs.version }}
+    steps:
+    - name: Checkout main branch
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ env.MAIN_BRANCH }}
+        fetch-depth: 0
+
+    - name: Calculate Version and Create Git Tag
+      id: create-tag
+      run: |
+        BRANCH_NAME="${{ github.ref_name }}"
+        
+        echo "✅ Production build running on branch: $BRANCH_NAME"
+        echo "Branch validation passed - using ${{ env.MAIN_BRANCH }} branch"
+        
+        # Get the latest version from existing Git tags
+        LATEST_VERSION=$(git tag --sort=-version:refname | head -1 | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' || echo "")
+        
+        if [ -n "$LATEST_VERSION" ]; then
+          # Extract version number and increment
+          VERSION_NUM=$(echo "$LATEST_VERSION" | sed 's/v//' | awk -F. '{print $1"."$2"."$3+1}')
+          VERSION="v$VERSION_NUM"
+          echo "📈 Incrementing version from $LATEST_VERSION to $VERSION"
+        else
+          # No existing version tags, start with v1.0.0
+          VERSION="v1.0.0"
+          echo "🚀 Starting with initial version: $VERSION"
+        fi
+        
+        echo "🏷️ Creating Git tag: $VERSION"
+        
+        # Create and push the tag
+        git tag "$VERSION"
+        git push origin "$VERSION"
+        
+        echo "✅ Git tag created and pushed successfully: $VERSION"
+        echo "📦 Docker image will be: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }}:$VERSION"
+        
+        # Set output for other jobs
+        echo "version=$VERSION" >> $GITHUB_OUTPUT
+        
+        echo "✅ Output set: version=$VERSION"
+        echo "Branch: $BRANCH_NAME"
+        echo "Version: $VERSION"
+
+  build-and-push:
+    name: Build and Push Docker Image
+    needs: create-tag
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    outputs:
+      image-tag: ${{ steps.set-outputs.outputs.image-tag }}
+      image-name: ${{ steps.set-outputs.outputs.image-name }}
+      image-repository: ${{ steps.set-outputs.outputs.image-repository }}
+      version: ${{ needs.create-tag.outputs.version }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v4
+      with:
+        go-version: ${{ env.GO_VERSION }}
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Log in to Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ${{ env.DOCKER_REGISTRY }}
+        username: ${{ env.DOCKER_REGISTRY_USERNAME }}
+        password: ${{ env.DOCKER_REGISTRY_TOKEN }}
+
+    - name: Build Binary
+      run: |
+        # Install builder
+        go install go.opentelemetry.io/collector/cmd/builder@${{ env.BUILDER_VERSION }}
+        
+        # Build the collector
+        builder --config=builder-config.yaml
+        
+        echo "Build complete. Binary available at: cmd/$BINARY_NAME"
+
+    - name: Build and Push Docker Image
+      id: build
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.multiarch
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: |
+          ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }}:${{ needs.create-tag.outputs.version }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BINARY_NAME=${{ env.BINARY_NAME }}
+          BUILDER_VERSION=${{ env.BUILDER_VERSION }}
+          OTEL_HELM_CHART_VERSION=${{ env.OTEL_HELM_CHART_VERSION }}
+
+    - name: Set Build Outputs
+      id: set-outputs
+      run: |
+        VERSION="${{ needs.create-tag.outputs.version }}"
+        ENVIRONMENT="${{ env.CLUSTER_ENV }}"        
+        
+        echo "image-tag=$VERSION" >> $GITHUB_OUTPUT
+        echo "image-name=${{ env.DOCKER_IMAGE_NAME }}" >> $GITHUB_OUTPUT
+        echo "image-repository=${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/$ENVIRONMENT/${{ env.DOCKER_IMAGE_NAME }}" >> $GITHUB_OUTPUT
+        
+        echo "✅ Outputs set:"
+        echo "  image-tag: $VERSION"
+        echo "  image-name: ${{ env.DOCKER_IMAGE_NAME }}"
+        echo "  image-repository: ${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/$ENVIRONMENT/${{ env.DOCKER_IMAGE_NAME }}"
+
+  cleanup-tag:
+    name: Cleanup Tag on Build Failure
+    needs: [create-tag, build-and-push]
+    runs-on: ubuntu-22.04
+    if: failure()
+    continue-on-error: false
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Cleanup Failed Build
+      run: |
+        echo "🚨 BUILD FAILED - Starting cleanup process..."
+        
+        VERSION="${{ needs.create-tag.outputs.version }}"
+        echo "🗑️ Cleaning up Git tag: $VERSION"
+        
+        # Delete the tag from remote repository
+        if git push origin --delete "$VERSION" 2>/dev/null; then
+          echo "✅ Successfully deleted remote tag: $VERSION"
+        else
+          echo "⚠️ Could not delete remote tag (may not exist): $VERSION"
+        fi
+        
+        # Delete the tag locally
+        if git tag -d "$VERSION" 2>/dev/null; then
+          echo "✅ Successfully deleted local tag: $VERSION"
+        else
+          echo "⚠️ Could not delete local tag (may not exist): $VERSION"
+        fi
+        
+        echo "🧹 Cleanup completed for failed build"
+        echo "Tag '$VERSION' has been removed from the repository"
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+
+  build-summary:
+    name: Build Summary
+    needs: [build-and-push]
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    steps:
+    - name: Create Build Summary
+      run: |
+        echo "## 🏗️ BUILD SUMMARY" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### ✅ Build Completed Successfully!" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 📦 Docker Image Details" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Repository**: \`${{ needs.build-and-push.outputs.image-repository }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Image Tag**: \`${{ needs.build-and-push.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Full Image**: \`${{ needs.build-and-push.outputs.image-repository }}:${{ needs.build-and-push.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🏷️ Version Information" >> $GITHUB_STEP_SUMMARY
+        echo "- **Version**: \`${{ needs.build-and-push.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Git Tag**: \`${{ needs.build-and-push.outputs.version }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Git Tags Page**: [View Tags](https://github.com/${{ github.repository }}/tags)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🌍 Environment & Build Details" >> $GITHUB_STEP_SUMMARY
+        echo "- **Environment**: \`${{ env.CLUSTER_ENV }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Build Number**: \`${{ github.run_number }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Branch**: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Commit**: \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Triggered by**: \`${{ github.actor }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🔗 Quick Links" >> $GITHUB_STEP_SUMMARY
+        echo "- **Docker Registry**: [View Image](https://${{ env.DOCKER_REGISTRY }}/${{ env.DOCKER_REGISTRY_USERNAME }}/${{ env.CLUSTER_ENV }}/${{ env.DOCKER_IMAGE_NAME }})" >> $GITHUB_STEP_SUMMARY
+        echo "- **GitHub Repository**: [View Repo](https://github.com/${{ github.repository }})" >> $GITHUB_STEP_SUMMARY
+        echo "- **Git Tags**: [View Tags](https://github.com/${{ github.repository }}/tags)" >> $GITHUB_STEP_SUMMARY
+        echo "" >> $GITHUB_STEP_SUMMARY
+        echo "### 🚀 Next Steps" >> $GITHUB_STEP_SUMMARY
+        if [ "${{ github.event.inputs.auto_deploy }}" = "true" ]; then
+          echo "- **Auto-deploy**: ✅ Enabled - Deploying to \`${{ github.event.inputs.deploy_provider }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Deploy Target**: \`${{ github.event.inputs.deploy_provider }}-${{ env.CLUSTER_ENV }}\`" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "- **Auto-deploy**: ❌ Disabled - Use deploy workflow to deploy this image" >> $GITHUB_STEP_SUMMARY
+        fi
+        echo "- **Manual Deploy**: Use the \`deploy-only.yml\` workflow with image tag: \`${{ needs.build-and-push.outputs.image-tag }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "- **Available Versions**: Check [Git Tags](https://github.com/${{ github.repository }}/tags) for all versions" >> $GITHUB_STEP_SUMMARY
+
+  trigger-deploy:
+    name: Trigger Deploy
+    needs: build-and-push
+    runs-on: ubuntu-22.04
+    continue-on-error: false
+    if: ${{ github.event.inputs.auto_deploy == 'true' && github.event.inputs.deploy_provider != '' }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Trigger Deploy Workflow
+      run: |
+        # Trigger deploy workflow with build outputs
+        echo "🚀 Triggering deploy workflow..."
+        echo "Deploy provider: ${{ github.event.inputs.deploy_provider }}"
+        echo "Image tag: '${{ needs.build-and-push.outputs.image-tag }}'"
+        echo "Production confirmation: '${{ github.event.inputs.production_confirmation }}'"
+        echo ""
+        
+        gh workflow run deploy-prod.yml \
+          --field deploy_provider="${{ github.event.inputs.deploy_provider }}" \
+          --field image_tag="${{ needs.build-and-push.outputs.image-tag }}" \
+          --field production_confirmation="${{ github.event.inputs.production_confirmation }}"
+      env:
+        GITHUB_TOKEN: ${{ github.token }} 

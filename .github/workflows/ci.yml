@@ -1,0 +1,194 @@
+name: "CI - ck-intel-collector - build, test, release"
+
+permissions:
+  contents: write    # Create releases and tags
+  packages: write    # Push Docker images
+
+on:
+  workflow_dispatch:     # Manual trigger
+  repository_dispatch:   # Trigger from orchestration pipeline
+    types: [trigger-build-workflow]
+
+env:
+  DOCKER_IMAGE_PATH: ghcr.io/ckgitrepouser/gcp-demo/ck-intel-collector
+  BINARY_NAME: ck-otelcol
+  OTEL_HELM_CHART_VERSION: 0.126.0
+  GO_VERSION: '1.23'
+  BUILDER_VERSION: v0.128.0
+  TEST_MODULES: "processor/metricsaggregatorprocessor exporter/prometheusexporter internal/common/testdata internal/coreinternal/testutil"
+
+jobs:
+
+  create-tag:
+    name: Create Git Tag
+    runs-on: ubuntu-22.04
+    outputs:
+      current_tag: ${{ steps.create-tag.outputs.current_tag }}
+      next_tag: ${{ steps.create-tag.outputs.next_tag }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: Bump patch version
+      id: version
+      uses: firgga-sunil/poc-app-of-apps/.github/actions/fetch-and-increment-version@main
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}   
+  build-and-push:
+    name: Build and Push Docker Image
+    needs: create-tag
+    runs-on: ubuntu-22.04
+    outputs:
+      image-repository: ${{ steps.set-outputs.outputs.image-repository }}
+      image-tag: ${{ steps.set-outputs.outputs.image-tag }}
+      image-full: ${{ steps.set-outputs.outputs.image-full }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ env.GO_VERSION }}
+        cache: true
+
+    - name: Install OpenTelemetry Collector Builder
+      run: |
+        set -e
+        
+        echo "📦 Installing OpenTelemetry Collector Builder..."
+        go install go.opentelemetry.io/collector/cmd/builder@${{ env.BUILDER_VERSION }}
+        
+        builder version
+        echo "✅ Builder installed successfully"
+    - name: Build OTEL Collector Binary
+      run: |
+        set -e
+        
+        echo "🔨 Building OpenTelemetry Collector binary..."
+        builder --config=builder-config.yaml
+        
+        if [[ ! -f "cmd/${{ env.BINARY_NAME }}" ]]; then
+          echo "❌ Binary not found at cmd/${{ env.BINARY_NAME }}"
+          ls -lah cmd/ || true
+          exit 1
+        fi
+        
+        echo "✅ Binary built successfully: cmd/${{ env.BINARY_NAME }}"
+        cmd/${{ env.BINARY_NAME }} --version
+    - name: Tidy and Test CMD Module
+      run: |
+        set -e
+        
+        echo "🧹 Tidying cmd module (created by builder)..."
+        cd cmd
+        go mod tidy
+        echo "✅ cmd module tidied"
+        
+        echo ""
+        echo "🧪 Testing cmd module..."
+        if go test -v ./... 2>&1; then
+          echo "✅ cmd module: TESTS PASSED"
+        else
+          echo "❌ cmd module: TESTS FAILED"
+          exit 1
+        fi
+        cd $GITHUB_WORKSPACE
+    - name: Set up QEMU for Multi-Platform
+      uses: docker/setup-qemu-action@v3
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@v3
+      with:
+        registry: ghcr.io
+        username: ${{ secrets.GPR_USER }}
+        password: ${{ secrets.GPR_TOKEN }}
+
+    - name: Build and Push Multi-Platform Docker Image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: ./Dockerfile.multiarch
+        platforms: linux/amd64,linux/arm64
+        push: true
+        tags: ${{ env.DOCKER_IMAGE_PATH }}:${{ needs.create-tag.outputs.next_tag }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+        build-args: |
+          BINARY_NAME=${{ env.BINARY_NAME }}
+          BUILDER_VERSION=${{ env.BUILDER_VERSION }}
+          OTEL_HELM_CHART_VERSION=${{ env.OTEL_HELM_CHART_VERSION }}
+    - name: Verify Image in Registry
+      run: |
+        set -e
+        
+        TAG="${{ needs.create-tag.outputs.next_tag }}"
+        IMAGE="${{ env.DOCKER_IMAGE_PATH }}"
+        
+        echo "🔍 Verifying image in registry..."
+        if docker manifest inspect "${IMAGE}:${TAG}" > /dev/null 2>&1; then
+          echo "✅ Image successfully pushed to registry"
+          echo ""
+          echo "📋 Image manifest:"
+          docker manifest inspect "${IMAGE}:${TAG}"
+        else
+          echo "❌ Image not found in registry"
+          exit 1
+        fi
+    - name: Set Build Outputs
+      id: set-outputs
+      run: |
+        VERSION="${{ needs.create-tag.outputs.next_tag }}"
+        REPO="${{ env.DOCKER_IMAGE_PATH }}"
+        
+        echo "image-repository=$REPO" >> $GITHUB_OUTPUT
+        echo "image-tag=$VERSION" >> $GITHUB_OUTPUT
+        echo "image-full=$REPO:$VERSION" >> $GITHUB_OUTPUT
+        
+        echo "✅ Build outputs set:"
+        echo "  Repository: $REPO"
+        echo "  Tag: $VERSION"
+        echo "  Full: $REPO:$VERSION"
+  create-release:
+    name: Create GitHub Release
+    needs: [create-tag, build-and-push]
+    runs-on: ubuntu-22.04
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Create GitHub Release
+      uses: firgga-sunil/poc-app-of-apps/.github/actions/create-github-release@main
+      with:
+        github_token: ${{ secrets.GITHUB_TOKEN }}
+        tag: ${{ steps.version.outputs.tag }}
+        latest_tag: ${{ steps.version.outputs.latest_tag }}
+        image: ${{ env.DOCKER_IMAGE_PATH }}
+  build-summary:
+    name: Build Summary
+    needs: [create-tag, build-and-push, create-release]
+    runs-on: ubuntu-22.04
+    if: always()
+    steps:
+    - name: Create Build Summary
+      run: |
+        IMAGE="${{ env.DOCKER_IMAGE_PATH }}:${{ needs.create-tag.outputs.next_tag }}"
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a $GITHUB_STEP_SUMMARY
+        echo "✅ PIPELINE COMPLETED" | tee -a $GITHUB_STEP_SUMMARY
+        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━" | tee -a $GITHUB_STEP_SUMMARY
+        echo "" | tee -a $GITHUB_STEP_SUMMARY
+        echo "**Previous Tag:** ${{ needs.create-tag.outputs.current_tag }}" | tee -a $GITHUB_STEP_SUMMARY
+        echo "**New Tag:** ${{ needs.create-tag.outputs.next_tag }}" | tee -a $GITHUB_STEP_SUMMARY
+        echo "**Image:** \`$IMAGE\`" | tee -a $GITHUB_STEP_SUMMARY
+        echo "" | tee -a $GITHUB_STEP_SUMMARY
+        echo "**Platforms:** linux/amd64, linux/arm64" | tee -a $GITHUB_STEP_SUMMARY
+        echo "" | tee -a $GITHUB_STEP_SUMMARY
+        echo "### Pull Command" | tee -a $GITHUB_STEP_SUMMARY
+        echo '```bash' | tee -a $GITHUB_STEP_SUMMARY
+        echo "docker pull $IMAGE" | tee -a $GITHUB_STEP_SUMMARY
+        echo '```' | tee -a $GITHUB_STEP_SUMMARY

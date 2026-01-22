@@ -1,0 +1,56 @@
+# Multi-stage Docker build similar to opentelemetry-collector-contrib approach
+# This uses the OpenTelemetry Collector Builder (OCB) within Docker
+
+FROM alpine:3.20 AS certs
+RUN apk --update add ca-certificates
+
+FROM golang:1.23 AS build-env
+WORKDIR /build
+
+# Copy the builder configuration
+COPY builder-config.yaml .
+
+# Install the OpenTelemetry Collector Builder (OCB)
+RUN go install go.opentelemetry.io/collector/cmd/builder@v0.128.0
+
+# Copy the custom processor, exporter, and receiver source code
+COPY processor ./processor
+COPY exporter ./exporter
+COPY receiver ./receiver
+COPY internal ./internal
+
+# Build the ck-otel-collector using OCB with CGO disabled for static linking
+ENV CGO_ENABLED=0
+ENV GOOS=linux
+RUN builder --config=builder-config.yaml
+
+# Final stage: create the runtime image
+FROM alpine:3.20
+
+# Install ca-certificates for TLS connections
+RUN apk --no-cache add ca-certificates
+
+# Create a non-root user
+RUN addgroup -g 10001 otel && \
+    adduser -D -u 10001 -G otel otel
+
+# Copy the ck-otel-collector binary from the build stage
+COPY --from=build-env /build/cmd/ck-otelcol /ck-otelcol
+
+# Make the binary executable
+RUN chmod +x /ck-otelcol
+
+# Switch to non-root user
+USER otel
+
+# Expose common ports
+# 4319 - OTLP gRPC receiver
+# 8889 - Prometheus metrics endpoint (application metrics)
+# 8888 - Collector internal metrics (self-telemetry)
+# 1777 - pprof (performance profiling)
+# 13134 - Health check
+EXPOSE 4319 8889 8888 1777 13134
+
+# Set the entrypoint
+ENTRYPOINT ["/ck-otelcol"]
+CMD ["--config=/etc/otelcol-contrib/config.yaml"] 

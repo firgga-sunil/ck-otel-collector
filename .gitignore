@@ -1,0 +1,140 @@
+# If you prefer the allow list template instead of the deny list, see community template:
+# https://github.com/github/gitignore/blob/main/community/Golang/Go.AllowList.gitignore
+#
+# Binaries for programs and plugins
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary, built with `go test -c`
+*.test
+
+# Code coverage profiles and other test artifacts
+*.out
+coverage.*
+*.coverprofile
+profile.cov
+
+# Dependency directories (remove the comment below to include it)
+# vendor/
+
+# Go workspace file
+go.work
+go.work.sum
+
+# env file
+.env
+
+# Editor/IDE
+# .idea/
+# .vscode/
+
+# OpenTelemetry Collector Build Artifacts
+/cmd/
+/dist/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go build artifacts
+*.test
+*.out
+/vendor/
+go.work
+go.work.sum
+
+# Go module cache
+go.sum
+
+# IDE and Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Docker artifacts
+*.tar
+*.tar.gz
+
+# Kubernetes secrets and sensitive files
+*.key
+*.crt
+*.pem
+secrets/
+*.secret
+*-secret.yaml
+*-secrets.yaml
+
+# Helm charts and temporary files
+charts/
+*.tgz
+.helm/
+
+# Log files
+*.log
+/logs/
+
+# Temporary files
+tmp/
+temp/
+.tmp/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Backup files
+*.bak
+*.backup
+*~
+
+# Environment files (may contain sensitive data)
+.env
+.env.local
+.env.*.local
+
+# Coverage reports
+*.cover
+coverage.txt
+coverage.html
+
+# Profiling data
+*.prof
+*.pprof
+
+# Test artifacts
+testdata/output/
+test-results/
+
+# Local configuration overrides
+*-local.yaml
+*-dev.yaml
+local-*
+
+# Kind cluster config (if generated)
+kind-config.yaml
+
+# Terraform state files (if using Terraform)
+*.tfstate
+*.tfstate.*
+.terraform/
+
+# Node modules (if using any Node.js tools)
+node_modules/
+
+# Python cache (if using any Python tools)
+__pycache__/
+*.py[cod]
+*$py.class
